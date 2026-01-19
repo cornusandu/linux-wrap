@@ -3,15 +3,27 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <csetjmp>
+#include <cstring>
+#include <string>
+#include <unordered_map>
 
 #define HIDE_SYMBOL __attribute__((visibility("hidden")))
+
+struct FHandle {
+    size_t id;
+};
 
 struct HIDE_SYMBOL FHandleListEntry {
     size_t id;
     char* path;
+    ssize_t fd = -1;
 };
 
 std::vector<FHandleListEntry> fhandle_list;
+std::unordered_map<std::string, std::shared_ptr<FHandle>> table;
+
+static QWORD handle_id = 0;
 
 HIDE_SYMBOL char isInit = 0;
 
@@ -21,48 +33,58 @@ void fs::init() {
     isInit = 1;
 }
 
-HIDE_SYMBOL FHandle::FHandle(const char* path) {
-    this->id = fhandle_list.size();
-    fhandle_list.push_back(FHandleListEntry{.id=this->id, .path=(char*)path});
-}
+std::shared_ptr<FHandle> &fs::gainHandle(const char* path) {
+    auto& ptr = table[std::string(path)];
+    if (ptr) {
+        return ptr;
+    }
 
-FHandle fs::gainHandle(SharedDArray<char> path) {
-    return FHandle(path.get());
-}
-
-SharedDArray<char> readFile(FHandle path) {
-    goto goto_fstart;
-
-    goto_failure:
-    return SharedDArray<char>((char*)0x0);
-
-    goto_fstart:
-    char* _path = nullptr;
-    int fd;
-    ssize_t n;
-    size_t i = 0;
-    for (FHandleListEntry p : fhandle_list) {
-        if (p.id == path.get_id()) {
-            _path = p.path;
+    if (fhandle_list.size() > 128) {  // Start removing unnecessary "tomb" items
+        for (QWORD i = 0; i < fhandle_list.size(); ) {
+            if (fhandle_list[i].path == nullptr && fhandle_list[i].fd < 0) {
+                fhandle_list.erase(fhandle_list.begin() + i);
+            } else {
+                ++i;
+            }
         }
     }
-    if (!_path) goto goto_failure;
-    open(_path, O_RDONLY);
-    if (fd < 0) goto goto_failure; 
 
-    std::vector<char> buffer(4096);
-    std::vector<char> _result;
-
-    while ((n = read(fd, buffer.data(), buffer.size())) > 0) {
-        _result.insert(_result.end(), buffer.begin(), buffer.begin() + n);
+    for (FHandleListEntry &entry : fhandle_list) {
+        if (entry.path == nullptr) continue;
+        if (strcmp(entry.path, path) == 0) {
+            FHandle *handle = new FHandle{.id=entry.id};
+            table[std::string(entry.path)] = std::shared_ptr<FHandle>(handle, [](FHandle* ptr) {
+                for (FHandleListEntry &entry : fhandle_list) {
+                    if (entry.id == ptr->id && entry.fd >= 0) {
+                        close(entry.fd);
+                        entry.fd = -1;
+                    }
+                }
+                delete ptr;
+            });
+            return table[std::string(entry.path)];
+        }
     }
 
-    SharedDArray<char> result = std::shared_ptr<char[]>((char*)calloc(_result.size() + 1, 1));
-    
-    for (char n : _result) {
-        result[i] = n;
-        i++;
-    }
-
-    return result;
+    QWORD id = handle_id;
+    handle_id++;
+    FHandle *handle = new FHandle{.id=id};
+    table[std::string(path)] = std::shared_ptr<FHandle>(handle, [](FHandle* ptr) {
+        if (fhandle_list.empty()) return;
+        for (FHandleListEntry &entry : fhandle_list) {
+            if (entry.id == ptr->id && entry.fd >= 0) {
+                close(entry.fd);
+                free(entry.path);
+                entry.path = nullptr;
+                entry.fd = -1;
+            }
+        }
+        delete ptr;
+    });
+    char* path2 = (char*)malloc(strlen(path)+1);
+    memcpy(path2, path, strlen(path)+1);
+    fhandle_list.push_back(FHandleListEntry{.id=id, .path = path2, .fd=open(path2, O_RDWR)});
+    return table[std::string(path)];
 }
+
+DArray<char> readFile(std::shared_ptr<FHandle> path);
